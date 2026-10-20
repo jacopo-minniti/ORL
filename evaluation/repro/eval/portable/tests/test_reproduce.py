@@ -14,6 +14,28 @@ from repro.eval.portable.build_recipe import build
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_cluster_scorer_retains_namespace_and_mount_isolation(self):
+        from repro.eval.portable.reproduce import apptainer_rlimits_command
+        roots = {key: Path('/local') / key for key in ('runtime', 'inputs', 'output')}
+        mapped = {key: Path('/') / key for key in roots}
+        config = {'script': 'score.py', 'args': ['--out', '{output}']}
+        with patch.dict(os.environ, {'SLURM_JOB_ID': '123'}), \
+             patch('os.sched_getaffinity', return_value={4, 5, 6, 7}):
+            argv = apptainer_rlimits_command(config, roots, mapped, '/scorer.sif', 'unit', '/work')
+        self.assertEqual(argv[:3], ['taskset', '--cpu-list', '4,5'])
+        for flag in ('--as=8589934592:8589934592', '--nproc=128:128', '--map-user=65534',
+                     '--map-group=65534', '--net', '--containall', '--no-home'):
+            self.assertIn(flag, argv)
+        self.assertIn('/local/runtime:/runtime:ro', argv)
+        self.assertIn('/local/inputs:/inputs:ro', argv)
+        self.assertNotIn('/local/model', ' '.join(argv))
+        self.assertNotIn('systemd-run', argv)
+
+    def test_cluster_scorer_requires_allocation(self):
+        from repro.eval.portable.reproduce import apptainer_rlimits_command
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, 'Slurm'):
+            apptainer_rlimits_command({}, {}, {}, '/scorer.sif', 'unit', '/work')
+
     def test_dg_mbpp_uses_original_427_client_contract(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);problems=root/'mbpp.jsonl'

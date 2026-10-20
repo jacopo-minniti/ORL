@@ -85,6 +85,7 @@ from verl.trainer.ppo.hybrid_ce_negative_pg import (
     combine_hybrid_objective,
     compute_chunked_action_log_probs,
 )
+from verl.trainer.ppo.llada2_bptt import hidden_to_soft_embedding, expand_bptt_block_signal, StagedBPTTReplay, bptt_token_validity
 from verl.trainer.ppo.qwen_nostream_grpo import require_native_external_prefix_kv_backend
 from verl.trainer.ppo.response_level_ce import (
     build_response_level_aec_pair_weights,
@@ -3151,6 +3152,177 @@ class DataParallelPPOActor(BasePPOActor):
         except Exception as exc:
             print(f"[ActorReplayTokenDebug] failed: {exc}", flush=True)
 
+    def _forward_micro_batch_with_bptt(
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        calculate_entropy: bool = False,
+        staged_backward: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Replay predecessor states, then supervise only the endpoint state."""
+
+        valid_mask = micro_batch.get("bptt_valid_mask")
+        if valid_mask is None:
+            if self.config.get("generation_consistency_jsd", {}).get("bptt", {}).get("enable", False):
+                raise RuntimeError("BPTT is enabled but the actor batch lost its predecessor payload")
+            return self._forward_micro_batch(
+                micro_batch,
+                temperature=temperature,
+                calculate_entropy=calculate_entropy,
+            )
+        if valid_mask.dim() not in (2, 3):
+            raise RuntimeError(
+                "bptt_valid_mask must be [batch, horizon-1] or [batch, horizon-1, pages], got "
+                f"{tuple(valid_mask.shape)}"
+            )
+        # Expand only this GPU microbatch; full rollout batches stay compact.
+        if "bptt_block_starts" in micro_batch:
+            micro_batch = dict(micro_batch)
+            prefix = "rollout_self_conditioning_signal_block_"
+            micro_batch["rollout_self_conditioning_signal"] = expand_bptt_block_signal(
+                micro_batch[prefix + "values"],
+                micro_batch[prefix + "starts"],
+                micro_batch[prefix + "lengths"],
+                response_length=int(micro_batch["responses"].shape[-1]),
+            )
+            for suffix in ("values", "starts", "lengths", "rows"):
+                micro_batch.pop(prefix + suffix, None)
+        required = (
+            "bptt_input_ids",
+            "bptt_responses",
+            "bptt_rollout_self_conditioning_signal",
+            "rollout_self_conditioning_signal",
+        )
+        missing = [key for key in required if key not in micro_batch]
+        if missing:
+            raise RuntimeError(f"LLaDA2 BPTT actor batch is missing {missing}")
+
+        endpoint_inputs = {
+            key: value for key, value in micro_batch.items() if not key.startswith("bptt_")
+        }
+        chained_signal = None
+        chained_valid = None
+        depth = int(valid_mask.shape[1])
+        replay = None
+        if staged_backward and torch.is_grad_enabled():
+            replay = StagedBPTTReplay(
+                lambda inputs: self._forward_micro_batch(
+                    inputs, temperature=temperature, calculate_entropy=False
+                ),
+                profile_memory=micro_batch.get("_bptt_profile_memory", False),
+            )
+        for slot in range(depth):
+            slot_valid = valid_mask[:, slot].bool()
+            if valid_mask.dim() == 3:
+                slot_valid = bptt_token_validity(
+                    slot_valid, micro_batch["bptt_block_starts"][:, slot],
+                    micro_batch["bptt_block_lengths"][:, slot],
+                    block_size=int(micro_batch["bptt_rollout_self_conditioning_signal"].shape[-2]),
+                    response_length=int(micro_batch["responses"].shape[-1]),
+                )
+                singleton = micro_batch.get("bptt_packed_singleton")
+                if singleton is not None:
+                    # A variable-span window is kept as a complete original
+                    # row. Its bridge mask must retain unpacked row semantics,
+                    # including zero signal outside the predecessor's span.
+                    slot_valid = torch.where(
+                        singleton[:, None, None],
+                        valid_mask[:, slot].any(dim=-1)[:, None, None],
+                        slot_valid,
+                    )
+            else:
+                slot_valid = slot_valid.view(-1, 1, 1)
+            rollout_signal = micro_batch[
+                "bptt_rollout_self_conditioning_signal"
+            ][:, slot]
+            if "bptt_block_starts" in micro_batch:
+                rollout_signal = expand_bptt_block_signal(
+                    rollout_signal,
+                    micro_batch["bptt_block_starts"][:, slot],
+                    micro_batch["bptt_block_lengths"][:, slot],
+                    response_length=int(micro_batch["responses"].shape[-1]),
+                )
+            predecessor_inputs = dict(endpoint_inputs)
+            predecessor_inputs["input_ids"] = micro_batch["bptt_input_ids"][
+                :, slot
+            ]
+            predecessor_inputs["responses"] = micro_batch["bptt_responses"][
+                :, slot
+            ]
+            predecessor_inputs["response_mask"] = predecessor_inputs[
+                "responses"
+            ].ne(-100)
+            predecessor_inputs["rollout_self_conditioning_signal"] = (
+                rollout_signal
+            )
+            predecessor_inputs.pop("rollout_logits_source_hidden", None)
+            for key in (
+                "rollout_logits_source_hidden_block_values",
+                "rollout_logits_source_hidden_block_rows",
+                "rollout_logits_source_hidden_block_starts",
+                "rollout_logits_source_hidden_block_lengths",
+            ):
+                predecessor_inputs.pop(key, None)
+            use_chain = None
+            if chained_signal is not None:
+                use_chain = chained_valid & slot_valid
+                predecessor_inputs["_bptt_self_conditioning_signal"] = (
+                    torch.where(use_chain, chained_signal, rollout_signal)
+                )
+            predecessor_inputs["_bptt_return_signal_only"] = True
+            if replay is not None:
+                chained_signal = replay.predecessor(predecessor_inputs, use_chain)
+            else:
+                predecessor_output = self._forward_micro_batch(
+                    predecessor_inputs,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                )
+                chained_signal = predecessor_output["bptt_self_conditioning_signal"]
+            chained_valid = slot_valid
+            if micro_batch.get("_bptt_profile_memory", False):
+                print(
+                    f"[BPTT_GPU] stage=predecessor_{slot} "
+                    f"allocated_gib={torch.cuda.memory_allocated() / 2**30:.3f} "
+                    f"peak_gib={torch.cuda.max_memory_allocated() / 2**30:.3f}",
+                    flush=True,
+                )
+
+        if chained_signal is None:
+            raise RuntimeError("LLaDA2 BPTT received an empty predecessor depth")
+        endpoint_rollout_signal = endpoint_inputs[
+            "rollout_self_conditioning_signal"
+        ]
+        if replay is not None:
+            chained_signal = replay.endpoint_bridge(chained_signal)
+        endpoint_inputs["_bptt_self_conditioning_signal"] = torch.where(
+            chained_valid,
+            chained_signal,
+            endpoint_rollout_signal,
+        )
+        outputs = self._forward_micro_batch(
+            endpoint_inputs,
+            temperature=temperature,
+            calculate_entropy=calculate_entropy,
+        )
+        if replay is not None:
+            outputs["_bptt_backward_replay"] = replay
+        if micro_batch.get("_bptt_profile_memory", False):
+            print(
+                f"[BPTT_GPU] stage=endpoint "
+                f"allocated_gib={torch.cuda.memory_allocated() / 2**30:.3f} "
+                f"peak_gib={torch.cuda.max_memory_allocated() / 2**30:.3f}",
+                flush=True,
+            )
+        metrics = outputs.get("generation_jsd_metrics")
+        if isinstance(metrics, dict):
+            metrics["bptt/active_predecessor_rows"] = float(
+                valid_mask.sum().detach().item()
+            )
+            metrics["bptt/horizon"] = float(depth + 1)
+            metrics["bptt/staged_backward"] = float(replay is not None)
+        return outputs
+
     def _forward_micro_batch(
         self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
     ) -> dict[str, torch.Tensor]:
@@ -3291,7 +3463,14 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids.unsqueeze(-1), attention_mask
                 )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
-                rollout_sc_signal = micro_batch.get("rollout_self_conditioning_signal", None)
+                bptt_sc_signal = micro_batch.get(
+                    "_bptt_self_conditioning_signal", None
+                )
+                rollout_sc_signal = (
+                    bptt_sc_signal
+                    if bptt_sc_signal is not None
+                    else micro_batch.get("rollout_self_conditioning_signal", None)
+                )
                 rollout_sc_signal_rmpad = None
                 sparse_sc_block_values = micro_batch.get(
                     "rollout_self_conditioning_signal_block_values", None
@@ -4110,7 +4289,11 @@ class DataParallelPPOActor(BasePPOActor):
                     # but SDARPrefixKV still captures sc_signal into the replay.
                     _sc_owner = getattr(self.actor_module, "module", self.actor_module)
                     if getattr(_sc_owner, "self_conditioning", None) is not None:
-                        extra_args["self_conditioning_signal"] = rollout_sc_signal_rmpad.detach()
+                        extra_args["self_conditioning_signal"] = (
+                            rollout_sc_signal_rmpad
+                            if bptt_sc_signal is not None
+                            else rollout_sc_signal_rmpad.detach()
+                        )
                     elif not globals().get("_SC_SIGNAL_DROP_ANNOUNCED"):
                         globals()["_SC_SIGNAL_DROP_ANNOUNCED"] = True
                         print("[SC-SIGNAL] the actor has no self_conditioning adapter; "
@@ -4297,6 +4480,55 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                     logprob_temperature = self._effective_logprob_temperature(temperature)
                     valid_label_mask = labels_rmpad.ne(-100)
+                    if bool(micro_batch.get("_bptt_return_signal_only", False)):
+                        if not fast_hidden_ce:
+                            raise RuntimeError(
+                                "LLaDA2 BPTT signal replay requires the fast hidden CE path"
+                            )
+                        actor_module_unwrapped = getattr(
+                            self.actor_module, "module", self.actor_module
+                        )
+                        lm_head = getattr(actor_module_unwrapped, "lm_head", None)
+                        get_embeddings = getattr(
+                            actor_module_unwrapped, "get_input_embeddings", None
+                        )
+                        embeddings = (
+                            get_embeddings() if callable(get_embeddings) else None
+                        )
+                        if lm_head is None or embeddings is None:
+                            raise RuntimeError(
+                                "LLaDA2 BPTT requires actor lm_head and input embeddings"
+                            )
+                        selected = torch.nonzero(
+                            valid_label_mask, as_tuple=False
+                        ).flatten()
+                        selected_hidden = logits_rmpad.index_select(0, selected)
+                        bptt_config = generation_jsd_config.get("bptt", {}) or {}
+                        selected_signal = hidden_to_soft_embedding(
+                            selected_hidden,
+                            lm_head=lm_head,
+                            embedding_weight=embeddings.weight,
+                            chunk_size=int(
+                                bptt_config.get("projection_chunk_size", 8) or 8
+                            ),
+                            checkpoint_projection=bool(
+                                bptt_config.get("checkpoint_projection", True)
+                            ),
+                        )
+                        signal_rmpad = selected_signal.new_zeros(
+                            (int(logits_rmpad.shape[0]), int(embeddings.weight.shape[1]))
+                        ).index_copy(0, selected, selected_signal)
+                        full_signal = pad_input(
+                            hidden_states=signal_rmpad,
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
+                        return {
+                            "bptt_self_conditioning_signal": full_signal[
+                                :, -response_length:
+                            ]
+                        }
                     if generation_jsd_config.get("enable", False) and generation_jsd_objective == "tpf_reinforce":
                         valid_label_mask = torch.zeros_like(valid_label_mask)
                     generation_jsd_loss = None
@@ -9223,10 +9455,11 @@ class DataParallelPPOActor(BasePPOActor):
         } if (token_debug_enabled or input_checksum_debug_enabled) else model_inputs
 
         forward_start = time.perf_counter()
-        outputs = self._forward_micro_batch(
+        outputs = self._forward_micro_batch_with_bptt(
             forward_inputs,
             temperature=temperature,
             calculate_entropy=False,
+            staged_backward=True,
         )
         forward_seconds = time.perf_counter() - forward_start
 
@@ -9289,6 +9522,9 @@ class DataParallelPPOActor(BasePPOActor):
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+        bptt_replay = outputs.pop("_bptt_backward_replay", None)
+        if bptt_replay is not None:
+            bptt_replay.backward()
         if sync_after_backward:
             torch.cuda.synchronize()
         backward_seconds = time.perf_counter() - backward_start
@@ -9392,6 +9628,9 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if "rollout_self_conditioning_signal" in data.batch.keys():
             select_keys.append("rollout_self_conditioning_signal")
+        self._append_if_present(
+            select_keys, data.batch, [key for key in data.batch.keys() if key.startswith("bptt_")]
+        )
         if "rollout_logits_source_hidden" in data.batch.keys():
             select_keys.append("rollout_logits_source_hidden")
         if "response_tpf_ce_scale" in data.batch.keys():
@@ -9451,7 +9690,7 @@ class DataParallelPPOActor(BasePPOActor):
                 model_inputs["_actor_replay_debug_global_step"] = data.meta_info.get("global_step", None)
                 model_inputs["_actor_replay_debug_micro_idx"] = int(micro_idx)
             with torch.no_grad():
-                outputs = self._forward_micro_batch(
+                outputs = self._forward_micro_batch_with_bptt(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
             log_probs_lst.append(outputs["log_probs"].cpu())
@@ -9669,6 +9908,9 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rollout_confidence_weights")
         if "rollout_self_conditioning_signal" in data.batch.keys():
             select_keys.append("rollout_self_conditioning_signal")
+        self._append_if_present(
+            select_keys, data.batch, [key for key in data.batch.keys() if key.startswith("bptt_")]
+        )
         if "rollout_logits_source_hidden" in data.batch.keys():
             select_keys.append("rollout_logits_source_hidden")
         if "response_tpf_ce_scale" in data.batch.keys():
@@ -11372,6 +11614,22 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch = micro_batch.to(get_device_id())
                         micro_batch_metrics = {}
                         model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
+                        bptt_profile = (
+                            "bptt_valid_mask" in model_inputs
+                            and int(batch_idx) == 0 and int(micro_idx) < 2
+                            and bool(generation_jsd_config.get("bptt", {}).get("profile_memory", False))
+                        )
+                        if bptt_profile:
+                            torch.cuda.reset_peak_memory_stats()
+                            model_inputs["_bptt_profile_memory"] = True
+                            print(
+                                f"[BPTT_GPU] step={global_step} stage=start "
+                                f"allocated_gib={torch.cuda.memory_allocated() / 2**30:.3f} "
+                                f"rows={model_inputs['input_ids'].shape[0]} "
+                                f"tokens={model_inputs['attention_mask'].sum().item()} "
+                                f"checkpointing={any(getattr(m, 'gradient_checkpointing', False) for m in self.actor_module.modules())}",
+                                flush=True,
+                            )
                         response_mask = model_inputs["response_mask"]
                         old_log_prob = model_inputs["old_log_probs"]
                         advantages = model_inputs["advantages"]
@@ -11419,7 +11677,7 @@ class DataParallelPPOActor(BasePPOActor):
                         input_checksum_debug_enabled = self._actor_input_checksum_debug_enabled()
                         if tpf_reinforce_update and self._qwen_nostream_grpo_enabled():
                             micro_batch_metrics.update(self._call_qwen_external_prefix_kv_replay(micro_batch))
-                        outputs = self._forward_micro_batch(
+                        outputs = self._forward_micro_batch_with_bptt(
                             {
                                 **model_inputs,
                                 "_actor_replay_debug_phase": "update_policy",
@@ -11431,6 +11689,7 @@ class DataParallelPPOActor(BasePPOActor):
                             else model_inputs,
                             temperature=temperature,
                             calculate_entropy=calculate_entropy,
+                            staged_backward=True,
                         )
                         if entropy_rkl_probe_enable:
                             _probe_mb_stats = outputs.pop(
@@ -12399,6 +12658,26 @@ class DataParallelPPOActor(BasePPOActor):
                             self.scaler.scale(loss).backward()
                         else:
                             loss.backward()
+
+                        bptt_replay = outputs.pop("_bptt_backward_replay", None)
+                        if bptt_replay is not None:
+                            if bptt_profile:
+                                print(
+                                    f"[BPTT_GPU] step={global_step} stage=endpoint_backward "
+                                    f"allocated_gib={torch.cuda.memory_allocated() / 2**30:.3f} "
+                                    f"peak_gib={torch.cuda.max_memory_allocated() / 2**30:.3f}",
+                                    flush=True,
+                                )
+                            bptt_replay.backward()
+                            del bptt_replay
+
+                        if bptt_profile:
+                            print(
+                                f"[BPTT_GPU] step={global_step} stage=backward "
+                                f"allocated_gib={torch.cuda.memory_allocated() / 2**30:.3f} "
+                                f"peak_gib={torch.cuda.max_memory_allocated() / 2**30:.3f}",
+                                flush=True,
+                            )
 
                         metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                         if not is_rank_alignment_ghost:

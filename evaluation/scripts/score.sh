@@ -38,7 +38,7 @@ mkdir -p "$SCORING/unused-model" "$SCORING/attempts"
 attempt=$SCORING/attempts/$cell-$(date +%Y%m%d-%H%M%S)
 if ! python3 -m repro.eval.score --recipe "$bound/score_recipe.json" --runtime-root "$bound/runtime" \
     --input-root "$bound/inputs" --model-root "$SCORING/unused-model" --output-root "$attempt" \
-    --container-engine apptainer --apptainer-image "$IMAGES/python-scorer.sif" --execute > "$attempt.cli.log" 2>&1; then
+    --container-engine "${ORL_EVAL_SCORE_ENGINE:-apptainer}" --apptainer-image "$IMAGES/python-scorer.sif" --execute > "$attempt.cli.log" 2>&1; then
   echo "scoring failed: $attempt" >&2
   tail -5 "$attempt.cli.log" >&2
   tail -5 "$attempt/stage.log" >&2 2>/dev/null || true

@@ -98,6 +98,111 @@ come from Transformers' docstring checks and do not affect the overlay, which is
 
 ## Reproducing the paper runs
 
+### LLaDA2 truncated BPTT extension
+
+The LLaDA2 actor can replace detached rollout self-conditioning with a short
+differentiable replay window. It is off in the paper recipe and is enabled with:
+
+```text
+++actor_rollout_ref.actor.generation_consistency_jsd.bptt.enable=true
+++actor_rollout_ref.actor.generation_consistency_jsd.bptt.horizon=2
+```
+
+Selected states remain the only CE/AEC endpoints. Earlier same-block states are
+materialized only to construct the endpoint's self-conditioning signal. The
+initial signal at the oldest state is detached, so the horizon is exactly
+truncated. The BPTT launcher packs disjoint blocks of the same response into
+one row (`trace_all_ce_packing=all_blocks_per_round`), with up to 32 blocks per
+row. Each block retains its own predecessor states and temporal validity mask;
+first-step blocks use captured rollout signals even when neighboring blocks
+have differentiable predecessors. Packing retains every selected endpoint,
+label, and entropy pair, while sharing the clean context and transformer calls.
+It requires `trace_all_ce_packing_materialization=dense` (BPTT supplies its own
+compact hidden pages), `trace_all_ce_parallelism=none`, and Ulysses sequence
+parallel size 1. `BPTT_PACKING=none` restores the unpacked reference path.
+Hidden-state payloads stay in bounded block pages
+on the trainer and during transport; only the actor microbatch expands them.
+For 32-token blocks and a 4096-token response, this uses 128 times less storage
+for these payloads. `[BPTT]` log lines report compact hidden bytes, and
+`bptt/active_predecessor_rows` confirms that the actor executes temporal replay.
+The actor raises an error if BPTT is enabled but its predecessor payload is lost.
+
+On the cluster layout used by this checkout, `scripts/setup_llada2_cluster.sh`
+creates the pinned Apptainer runtime and pip venv, `scripts/check_llada2_cpu.sh`
+runs CPU preflight checks, and `scripts/train_llada2.sh` launches either
+`VARIANT=baseline` or `VARIANT=bptt`. `ORL_RUNS_DIR` takes precedence over the
+shared environment file's `RUNS_DIR`; use a fresh directory when comparing
+BPTT changes so earlier checkpoints are not resumed automatically.
+
+The cluster launcher saves every 50 steps by default (`SAVE_FREQ` overrides
+this interval). The published paper recipe retains its original 25-step interval.
+`TRAIN_STEPS` overrides the default 650-step endpoint, including when resuming.
+Run directory names retain the `-650` suffix for compatibility with existing
+checkpoints; the effective step limit comes from `TRAIN_STEPS`.
+
+BPTT GPU memory is controlled separately from compact host-side replay storage.
+Training uses staged backward: predecessors first run without saving a graph,
+then the endpoint backward computes the gradient of a leaf self-conditioning
+signal. Predecessors are recomputed in reverse order and backpropagate that
+gradient, including the masks at truncated block boundaries. All contributions
+accumulate before the optimizer step. RNG state is restored during recomputation,
+and loss normalization/AMP scaling is applied only at the endpoint.
+
+This preserves the temporal gradient while allowing FSDP to reduce gradients
+and release full weights after each traversal. Connecting two forwards of the
+same FSDP model to one backward delayed those releases until both temporal
+contributions arrived, causing a roughly 73 GiB backward peak on the initial
+four-H100 run despite only 9 GiB of live memory after the forwards. Staging adds
+one forward per predecessor; it does not use FSDP `no_sync`, which would retain
+full gradient buffers again. The connected implementation remains available
+inside the actor helper as a reference for tests; both actor update entrypoints
+explicitly select staging.
+
+Each replay row includes the prompt and clean/noisy response context, not just
+its 32 supervised tokens. MoE expert dispatch still needs temporary memory.
+The launcher also enables non-reentrant transformer activation checkpointing
+and checkpointed soft-embedding projection. Projection chunking alone does not
+bound saved vocabulary probabilities across chunks; checkpointing does.
+
+| Launcher variable (BPTT only) | Default | Memory effect |
+| --- | --- | --- |
+| `BPTT_GRADIENT_CHECKPOINTING` | `true` | Recompute transformer layers within each staged traversal; increases computation. |
+| `BPTT_CHECKPOINT_PROJECTION` | `true` | Recompute vocabulary probabilities per projection chunk during backward. |
+| `BPTT_PROJECTION_CHUNK_SIZE` | `8` | Lower values reduce projection workspace, with more launches; do not reduce dense parameter-gradient buffers. |
+| `BPTT_PACKING` | `all_blocks_per_round` | Share one model traversal across disjoint noisy blocks of a response; `none` is the reference path. |
+| `BPTT_PACKING_MAX_BLOCKS` | `32` | Cap blocks per packed row, trading model-call overhead against projection/activation workspace. |
+| `BPTT_REPLAY_CHUNK_SIZE` | `1` | Actual rows per actor microbatch in this streaming replay path; already at its minimum. |
+| `BPTT_OPTIMIZER_OFFLOAD` | `false` | Offload Adam state between actor updates; it is reloaded before training, so this does not reduce actor backward memory. |
+
+`ppo_max_token_len_per_gpu` is used by the alternative dynamic batching branch,
+not the streaming replay branch used here. Lowering it does not shrink these
+microbatches. Increasing FSDP size with more GPUs can reduce per-rank sharded
+parameter/gradient/optimizer memory. Reducing rollout response length can reduce
+per-row activation memory but changes the training experiment. Keep
+`fsdp_config.reshard_after_forward=true`. Cache clearing cannot free tensors
+still needed for backward.
+
+`[BPTT_GPU]` logs report the first two microbatches' live allocation after the
+predecessor and endpoint forwards, endpoint backward, and predecessor VJPs,
+plus the peak through backward, each update.
+These are PyTorch allocated-memory measurements, not total device usage, and
+are not an update-wide maximum. The checkpointing regression tests compare
+outputs and gradients to the direct projection and check saved activation
+storage. Staged tests compare gradients, accumulated optimizer updates, and RNG
+state against connected BPTT, including stochastic operations and padded windows.
+`tests/test_llada2_bptt_fsdp.py` additionally checks two-rank CPU FSDP gradient
+parity and verifies that full decoder weights are released at the temporal
+boundary. Run `scripts/check_llada2_cpu.sh` in the cluster runtime; the login
+node's user-site Torch may lack compiler dependencies needed by checkpointing.
+`tests/test_llada2_bptt_packing.py` checks coverage, partial blocks, per-block
+temporal masks, CE/entropy losses, gradients, optimizer updates, and the actual
+AEC metadata builder. Windows with differing endpoint/predecessor spans retain
+their complete individual replay rows and original temporal masks; compatible
+windows are still packed. Regression tests cover clipped spans and changed
+offsets/buckets, including loss, gradient, optimizer and FSDP parity.
+`[BPTT_PACKING]` reports endpoint and packed row counts, plus the number and a
+few examples of variable-span windows kept individually.
+
 Each recipe below trains with one script, exports the final checkpoint to a Hugging Face directory and evaluates the
 export with `evaluation/scripts/main_table.sh`, which prints every cell next to the paper's number (set up the
 evaluation as in [evaluation/README.md](../evaluation/README.md)).

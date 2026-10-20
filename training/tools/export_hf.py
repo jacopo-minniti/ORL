@@ -43,9 +43,13 @@ def main():
     parser.add_argument('--actor-dir', type=Path, required=True)
     parser.add_argument('--target', type=Path, required=True)
     parser.add_argument('--reference', type=Path, help='export of the same family whose key set is matched')
+    parser.add_argument('--llada2-base-reference', action='store_true',
+                        help='Reference is stock LLaDA2; also require the four ORL adapter tensors')
     parser.add_argument('--max-shard-size', default='5GB')
     parser.add_argument('--allow-drop', action='store_true', help='drop checkpoint tensors the reference does not name')
     args = parser.parse_args()
+    if args.llada2_base_reference and not args.reference:
+        parser.error('--llada2-base-reference requires --reference')
     if args.target.exists() and any(args.target.iterdir()):  # a failed export leaves the merger's empty target behind
         raise SystemExit(f'target exists: {args.target}')
 
@@ -62,6 +66,17 @@ def main():
     report = {'checkpoint_keys': len(state), 'renamed': [], 'dropped': []}
     if args.reference:
         layout = reference_tensors(args.reference)
+        if args.llada2_base_reference:
+            config = json.loads((args.actor_dir / 'huggingface/config.json').read_text())
+            if config.get('model_type') != 'llada2_moe' or not config.get('use_self_conditioning'):
+                raise ValueError('Expected an ORL LLaDA2 checkpoint with self-conditioning')
+            hidden = config['hidden_size']
+            intermediate = config.get('self_conditioning_intermediate_size', config['intermediate_size'])
+            for suffix, shape in {
+                'pre_norm.weight': [hidden], 'gate_proj.weight': [intermediate, hidden],
+                'up_proj.weight': [intermediate, hidden], 'down_proj.weight': [hidden, intermediate],
+            }.items():
+                layout['model.self_conditioning.' + suffix] = (None, shape, None)
         # The paper exports nest top-level modules under "model." (e.g. LLaDA self_conditioning.* -> model.self_conditioning.*).
         # DiffusionGemma runs one set of embed_tokens/layers/norm modules as both its text encoder and its diffusion
         # decoder; the checkpoint names them under model.encoder.language_model, the paper export under model.decoder.

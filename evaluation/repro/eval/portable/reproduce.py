@@ -117,6 +117,25 @@ def apptainer_command(config,roots,mapped,image,unit,work):
     return argv+[expand(a,mapped) for a in config.get('args',[])]
 
 
+def apptainer_rlimits_command(config, roots, mapped, image, unit, work):
+    """Cluster variant: OS rlimits and CPU affinity instead of a user systemd scope.
+
+    Namespace, UID, read-only mounts, pinned image and artifact checks are shared
+    with the standard scorer. The 8GiB limit covers virtual address space rather
+    than cgroup resident memory; this resource-accounting difference is explicit.
+    """
+    if not os.environ.get('SLURM_JOB_ID'):
+        raise ValueError('apptainer-rlimits requires a Slurm allocation')
+    cpus = sorted(os.sched_getaffinity(0))[:score_cpus(config)]
+    if len(cpus) != score_cpus(config):
+        raise ValueError('Insufficient allocated CPUs for isolated scoring')
+    original = apptainer_command(config, roots, mapped, image, unit, work)
+    tail = original[original.index('unshare'):]
+    return ['taskset', '--cpu-list', ','.join(map(str, cpus)),
+            'prlimit', '--as=8589934592:8589934592', '--nproc=128:128',
+            '--cpu=600:600', '--fsize=1073741824:1073741824', '--', *tail]
+
+
 def command(recipe,stage,roots,python,container_engine,apptainer_sif=None,unit=None,work=None):
     config=recipe['stages'][stage]
     if stage=='generate':
@@ -134,11 +153,12 @@ def command(recipe,stage,roots,python,container_engine,apptainer_sif=None,unit=N
     image=config['image']
     if not re.fullmatch(r'[^\s]+@sha256:[a-f0-9]{64}',image):raise ValueError('Scoring requires an immutable image digest')
     mapped={name:Path('/'+name) for name in ('runtime','inputs','output')}
-    if container_engine=='apptainer':
+    if container_engine in ('apptainer','apptainer-rlimits'):
         if config.get('platform') not in (None,'linux/amd64'):raise ValueError('Unsupported frozen scoring platform')
         if apptainer_sif is None or unit is None or work is None:
             raise ValueError('Apptainer scoring requires a local SIF, scope unit and work directory')
-        return apptainer_command(config,roots,mapped,apptainer_sif,unit,work),{}
+        builder = apptainer_rlimits_command if container_engine == 'apptainer-rlimits' else apptainer_command
+        return builder(config,roots,mapped,apptainer_sif,unit,work),{}
     argv=[container_engine,'run','--rm','--pull=never','--network=none','--read-only',
           '--cap-drop=ALL','--security-opt=no-new-privileges','--pids-limit=128',
           '--memory=8g',f'--cpus={score_cpus(config)}','--user=65534:65534','--ipc=private',
@@ -164,7 +184,7 @@ def main(argv=None):
     ap.add_argument('--model-root',type=Path,required=True)
     ap.add_argument('--output-root',type=Path,required=True)
     ap.add_argument('--python',default=sys.executable)
-    ap.add_argument('--container-engine',choices=('podman','docker','apptainer'),default='podman')
+    ap.add_argument('--container-engine',choices=('podman','docker','apptainer','apptainer-rlimits'),default='podman')
     ap.add_argument('--apptainer-image',type=Path,help='Local SIF pulled from the recipe image digest (apptainer only)')
     ap.add_argument('--execute',action='store_true')
     ap.add_argument('--timeout',type=int,default=7200)
@@ -184,7 +204,7 @@ def main(argv=None):
               '--manifest',str(contained(roots['inputs'],config['manifest'])),'--input-root',str(roots['inputs'])]
         env={}
     container_name='eval-'+uuid.uuid4().hex if args.stage=='score' else None
-    apptainer=args.stage=='score' and args.container_engine=='apptainer'
+    apptainer=args.stage=='score' and args.container_engine in ('apptainer','apptainer-rlimits')
     if args.stage!='aggregate':
         argv,env=command(recipe,args.stage,execution_roots,args.python,args.container_engine,
                          args.apptainer_image,container_name,roots['output']/'apptainer_work')
@@ -192,6 +212,8 @@ def main(argv=None):
     receipt={'protocol_id':recipe['protocol_id'],'recipe_sha256':sha256(args.recipe),
              'stage':args.stage,'dry_run':not args.execute,'command':argv,'environment':env,
              'historical_binding':recipe.get('historical_binding','')}
+    if args.container_engine == 'apptainer-rlimits':
+        receipt['resource_isolation'] = 'Slurm allocation; taskset CPUs; prlimit 8GiB address space, 128 processes, 600s CPU; no systemd cgroup'
     print(json.dumps(receipt,indent=2),flush=True)
     if not args.execute:return
     if roots['output'].exists():raise ValueError('Refusing an existing output directory; every attempt needs a new directory')
@@ -205,6 +227,8 @@ def main(argv=None):
     if apptainer:(roots['output']/'apptainer_work').mkdir()
     (roots['output']/'execution_receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
     clean_env={k:os.environ[k] for k in ('PATH','LANG','SYSTEMROOT') if k in os.environ}
+    if args.stage == 'generate':
+        clean_env.update({k: os.environ[k] for k in ('CUDA_VISIBLE_DEVICES',) if k in os.environ})
     if args.stage=='score':
         # These configure only the host engine; they are never passed or mounted into the container.
         clean_env.update({k:os.environ[k] for k in ('HOME','XDG_RUNTIME_DIR') if k in os.environ})
@@ -222,7 +246,8 @@ def main(argv=None):
                 os.killpg(process.pid,signal.SIGKILL);process.wait()
             status=124
             if container_name:
-                remove=(['systemctl','--user','kill','--signal=SIGKILL',container_name+'.scope'] if apptainer
+                remove=(['true'] if args.container_engine == 'apptainer-rlimits' else
+                        ['systemctl','--user','kill','--signal=SIGKILL',container_name+'.scope'] if apptainer
                         else [args.container_engine,'rm','--force',container_name])
                 cleanup=subprocess.run(remove,env=clean_env,stdout=log,stderr=subprocess.STDOUT,timeout=30,check=False)
                 receipt['container_cleanup_exit_code']=cleanup.returncode

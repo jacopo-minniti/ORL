@@ -291,6 +291,9 @@ overrides:
 - ++actor_rollout_ref.actor.data_loader_seed=20260725
 - ++data.seed=20260725
 - ++actor_rollout_ref.actor.generation_consistency_jsd.trace_all_ce_replay_input_mode=exact
+- ++actor_rollout_ref.actor.generation_consistency_jsd.bptt.enable=false
+- ++actor_rollout_ref.actor.generation_consistency_jsd.bptt.horizon=2
+- ++actor_rollout_ref.actor.generation_consistency_jsd.bptt.projection_chunk_size=8
 - ++actor_rollout_ref.actor.generation_consistency_jsd.trace_all_ce_random_seed=20260725
 - ++actor_rollout_ref.actor.generation_consistency_jsd.trace_all_ce_random_identity=trace_step_key
 - ++actor_rollout_ref.actor.generation_consistency_jsd.response_tpf_top1_filter.enable=false

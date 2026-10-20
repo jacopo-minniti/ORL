@@ -19,6 +19,47 @@ ORL, using the decoders and samplers recorded for the paper.
 
 ## Evaluate a model
 
+### This cluster (Slurm)
+
+From the repository root, submit an arbitrary LLaDA2 ORL checkpoint with:
+
+```bash
+bash evaluation/scripts/submit_llada2_eval.sh \
+  .exps/runs/llada2-mini-baseline-650/checkpoints/global_step_625 1 he
+# Four independent benchmark workers, one per allocated H100:
+bash evaluation/scripts/submit_llada2_eval.sh /path/to/checkpoint 4 "gsm8k math500 he mbpp"
+```
+
+Arguments are checkpoint path, GPU count (1–8), and benchmark names (space- or
+comma-separated; `humaneval` also accepts the alias `he`). A checkpoint can be a
+`global_step_N` directory, its `actor/` directory, or an HF safetensors export.
+The wrapper submits a shared CPU setup job if required and a CPU-only merge job
+(200GiB) for FSDP inputs, then a dependent GPU job (40GiB; `EVAL_MEM` overrides it);
+the GPU job defaults to two hours (`EVAL_TIME=04:00:00` overrides it). Setup time
+does not consume that GPU allocation. Logs are in `.logs/orl-llada2-eval-JOBID.out`.
+
+The job exports FSDP weights once, validates backbone shapes against the pinned
+stock LLaDA2 checkpoint plus the four required residual-adapter tensors, and uses
+the bundled `llada-orl` main-table protocol: seed 12345, greedy sampling, threshold
+0.85, fixed confidence temperature, block 32, and a 4096-token completion cap.
+Each benchmark runs serial requests on one GPU; multiple GPUs run benchmarks in
+parallel. The pinned scorer reports HumanEval **base-test** accuracy with
+EvalPlus 0.3.1 and clean per-response TPF. Outputs and summaries are under `.eval/`
+(`ORL_EVAL_WORK` overrides this). Rerunning the same checkpoint reuses finished
+benchmark generations. Use a new checkpoint path/work directory if replacing
+checkpoint contents; cached exports assume checkpoint paths are immutable.
+
+Cluster generation uses Slurm device allocation and Apptainer `--nv` in a
+network namespace. Cluster scoring uses the pinned Python3.11 image, UID65534,
+separate user/network namespaces, read-only input/runtime mounts, clean
+environment, CPU affinity and OS resource limits. The explicit
+`apptainer-rlimits` backend avoids a user systemd session: its 8GiB limit is on
+virtual address space rather than cgroup resident memory, and Slurm enforces the
+outer job allocation. This resource-accounting difference is recorded in the
+scoring receipt; scorer sources, dependencies, prompts and metrics are unchanged.
+
+### Portable evaluation
+
 ```bash
 export ORL_EVAL_WORK=/path/to/eval-work   # images, runtimes, inputs, model copies, generations and scores
 export MODELS=/path/to/models              # downloaded models

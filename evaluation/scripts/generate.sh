@@ -27,6 +27,16 @@ build_recipe() {  # OUT_JSON args...
 
 container() {  # SIF CMD...  (this GPU only, as GPU 0; private loopback network)
   local sif=$1; shift
+  if [ "${ORL_EVAL_GPU_BINDING:-nvccli}" = slurm ]; then
+    # Slurm supplies GPU device isolation. --nv avoids nvidia-container-cli,
+    # which is not installed on the cluster. The outer namespace has no network.
+    [ -n "${SLURM_JOB_ID:-}" ] || { echo 'slurm GPU binding requires a Slurm allocation' >&2; return 2; }
+    unshare --user --map-root-user --net -- \
+      apptainer exec --nv --userns --contain --no-home --cleanenv --workdir "$scratch" \
+      -B "$BINDS" --pwd "$ORL_EVAL" \
+      --env "PYTHONDONTWRITEBYTECODE=1,PYTHONPATH=$ORL_EVAL,CUDA_VISIBLE_DEVICES=$GPU" "$sif" "$@"
+    return
+  fi
   NVIDIA_VISIBLE_DEVICES=$GPU apptainer exec --userns --nvccli --contain --net --network none --workdir "$scratch" \
     -B "$BINDS" --pwd "$ORL_EVAL" --env PYTHONDONTWRITEBYTECODE=1,PYTHONPATH=$ORL_EVAL,CUDA_VISIBLE_DEVICES=0 "$sif" "$@"
 }

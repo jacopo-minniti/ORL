@@ -68,6 +68,11 @@ from verl.trainer.ppo.trace_all_ce_state_selection import (
     select_trace_all_ce_states,
     validate_producer_preselected_trace_all_ce_states,
 )
+from verl.trainer.ppo.llada2_bptt import (
+    bptt_support_step_keys,
+    plan_bptt_windows,
+    pack_bptt_replay_rows,
+)
 from verl.trainer.ppo.signed_trace_ce import (
     RESPONSE_ROLE_NEGATIVE,
     RESPONSE_ROLE_POSITIVE,
@@ -14764,7 +14769,8 @@ class RayPPOTrainer:
         non_tensor_batch: Optional[dict[str, Any]],
         trace_replay_full_blocks_only: bool,
         config: TraceAllCEStateSelectionConfig,
-    ) -> tuple[dict[int, set[int]], dict[str, float]]:
+        bptt_horizon: Optional[int] = None,
+    ) -> tuple[dict[int, set[int]], dict[int, set[int]], dict[str, float]]:
         """Select trainable denoise states before packing or actor tensors."""
 
         batch_size = int(labels_aligned.shape[0])
@@ -15008,7 +15014,6 @@ class RayPPOTrainer:
                 candidate_rows,
                 config=config,
             )
-        selected_lease_ids: set[str] = set()
         for selected, (batch_index, trace_step_key, item) in zip(
             selection.selected_mask,
             candidate_refs,
@@ -15017,18 +15022,56 @@ class RayPPOTrainer:
             if not selected:
                 continue
             selected_by_batch[batch_index].add(trace_step_key)
-            for field_name in (
-                "self_conditioning_signal",
-                "logits_source_hidden",
-            ):
-                descriptor = item.get(field_name)
-                if (
-                    isinstance(descriptor, dict)
-                    and descriptor.get("format")
-                    == "sglang_sdar_gpu_replay_lease_v1"
-                    and descriptor.get("lease_id") is not None
+
+        materialized_by_batch = {
+            batch_index: set(step_keys)
+            for batch_index, step_keys in selected_by_batch.items()
+        }
+        if bptt_horizon is not None:
+            for batch_index, endpoint_keys in selected_by_batch.items():
+                states = (
+                    rollout_self_conditioning[batch_index]
+                    if rollout_self_conditioning is not None
+                    and batch_index < len(rollout_self_conditioning)
+                    else None
+                )
+                if not endpoint_keys or not isinstance(states, dict):
+                    continue
+                windows = plan_bptt_windows(
+                    states,
+                    endpoint_keys,
+                    horizon=int(bptt_horizon),
+                )
+                materialized_by_batch[batch_index] = bptt_support_step_keys(
+                    windows
+                )
+
+        selected_lease_ids: set[str] = set()
+        for batch_index, retained_keys in materialized_by_batch.items():
+            states = (
+                rollout_self_conditioning[batch_index]
+                if rollout_self_conditioning is not None
+                and batch_index < len(rollout_self_conditioning)
+                else None
+            )
+            if not isinstance(states, dict):
+                continue
+            for step_key in retained_keys:
+                item = self._get_self_conditioning_item(states, step_key)
+                if not isinstance(item, dict):
+                    continue
+                for field_name in (
+                    "self_conditioning_signal",
+                    "logits_source_hidden",
                 ):
-                    selected_lease_ids.add(str(descriptor["lease_id"]))
+                    descriptor = item.get(field_name)
+                    if (
+                        isinstance(descriptor, dict)
+                        and descriptor.get("format")
+                        == "sglang_sdar_gpu_replay_lease_v1"
+                        and descriptor.get("lease_id") is not None
+                    ):
+                        selected_lease_ids.add(str(descriptor["lease_id"]))
 
         discarded_descriptors: dict[str, dict[str, Any]] = {}
         for batch_index in range(batch_size):
@@ -15051,7 +15094,7 @@ class RayPPOTrainer:
             )
             if not isinstance(states, dict):
                 continue
-            selected_step_keys = selected_by_batch[batch_index]
+            selected_step_keys = materialized_by_batch[batch_index]
             for raw_step_key, item in states.items():
                 if not isinstance(item, dict):
                     continue
@@ -15092,7 +15135,10 @@ class RayPPOTrainer:
         metrics[
             "trace_all_ce_state_selection/released_gpu_lease_pages"
         ] = float(len(discarded_descriptors))
-        return selected_by_batch, metrics
+        metrics["bptt/materialized_support_states"] = float(
+            sum(len(keys) for keys in materialized_by_batch.values())
+        )
+        return selected_by_batch, materialized_by_batch, metrics
 
     def _collect_training_data(
         self,
@@ -15156,6 +15202,12 @@ class RayPPOTrainer:
         ext_tpf_action_ids = []
         ext_tpf_action_mask = []
         ext_tpf_rows: list[DiffusionTPFReplayRow] = []
+        ext_bptt_step_keys: list[int] = []
+        bptt_block_starts: list[int] = []
+        bptt_block_lengths: list[int] = []
+        bptt_windows_by_batch: dict[int, dict[int, tuple[int, ...]]] = {}
+        bptt_endpoint_keys_by_batch: dict[int, set[int]] = {}
+        bptt_payload: dict[str, torch.Tensor] = {}
         trace_all_ce_block_tokens = 0
         trace_all_ce_action_tokens = 0
         trace_all_ce_candidate_label_tokens = 0
@@ -15225,6 +15277,27 @@ class RayPPOTrainer:
             bool(jsd_cfg.get("enable", False))
             and str(jsd_cfg.get("objective", "")) == "trace_all_ce"
         )
+        bptt_cfg = jsd_cfg.get("bptt", {}) or {}
+        if not hasattr(bptt_cfg, "get"):
+            raise ValueError("generation_consistency_jsd.bptt must be a mapping")
+        bptt_enabled = bool(bptt_cfg.get("enable", False))
+        bptt_horizon = int(bptt_cfg.get("horizon", 2) or 2)
+        if bptt_enabled:
+            if not trace_all_ce_enabled:
+                raise ValueError(
+                    "LLaDA2 BPTT requires generation_consistency_jsd.enable=true "
+                    "and objective=trace_all_ce"
+                )
+            if bptt_horizon < 2:
+                raise ValueError(
+                    f"generation_consistency_jsd.bptt.horizon must be >= 2, got {bptt_horizon}"
+                )
+            if block_local_replay:
+                raise ValueError("LLaDA2 BPTT requires VERL_QWEN_BLOCK_LOCAL_REPLAY=0")
+            if sampled_action_replay_enabled or signed_trace_ce_enabled or causal_wrong_ce_enabled:
+                raise ValueError(
+                    "LLaDA2 BPTT is intentionally limited to the ordinary trace_all_ce path"
+                )
         trace_all_ce_token_scope = str(
             jsd_cfg.get("trace_all_ce_token_scope", "active_block_all")
             or "active_block_all"
@@ -15474,6 +15547,26 @@ class RayPPOTrainer:
             )
             or "block_only"
         ).strip().lower()
+        if bptt_enabled:
+            if trace_all_ce_packing not in {"none", "all_blocks_per_round"}:
+                raise ValueError(
+                    "LLaDA2 BPTT packing must be none or all_blocks_per_round"
+                )
+            if trace_all_ce_packing_materialization != "dense":
+                raise ValueError("BPTT uses its own compact temporal pages; set packing_materialization=dense")
+            if trace_all_ce_parallelism != "none":
+                raise ValueError(
+                    "LLaDA2 BPTT currently requires trace_all_ce_parallelism=none"
+                )
+            if int(
+                self.config.actor_rollout_ref.actor.get(
+                    "ulysses_sequence_parallel_size", 1
+                )
+                or 1
+            ) != 1:
+                raise ValueError(
+                    "LLaDA2 BPTT currently requires ulysses_sequence_parallel_size=1"
+                )
         if trace_all_ce_enabled and trace_all_ce_packing not in {
             "none",
             "all_blocks_unpacked",
@@ -15863,10 +15956,12 @@ class RayPPOTrainer:
             return manifest_to_mapping(manifest)
 
         trace_all_ce_selected_step_keys_by_batch = None
+        trace_all_ce_materialized_step_keys_by_batch = None
         if trace_all_ce_state_selection_enabled:
             assert trace_all_ce_state_selection_config is not None
             (
                 trace_all_ce_selected_step_keys_by_batch,
+                trace_all_ce_materialized_step_keys_by_batch,
                 trace_all_ce_state_selection_metrics,
             ) = self._select_trace_all_ce_state_step_keys(
                 rollout_self_conditioning=rollout_self_conditioning,
@@ -15880,6 +15975,7 @@ class RayPPOTrainer:
                     trace_replay_full_blocks_only
                 ),
                 config=trace_all_ce_state_selection_config,
+                bptt_horizon=bptt_horizon if bptt_enabled else None,
             )
 
         if tpf_reinforce_enabled and self._tpf_metadata_first_enabled():
@@ -15984,8 +16080,8 @@ class RayPPOTrainer:
                     trace_step_keys = sorted(int(k) for k in sc_b.keys())
                     explicit_trace_step_keys = False
                 if trace_all_ce_selected_step_keys_by_batch is not None:
-                    selected_step_keys = (
-                        trace_all_ce_selected_step_keys_by_batch.get(
+                    materialized_step_keys = (
+                        trace_all_ce_materialized_step_keys_by_batch.get(
                             b,
                             set(),
                         )
@@ -15993,8 +16089,28 @@ class RayPPOTrainer:
                     trace_step_keys = [
                         step_key
                         for step_key in trace_step_keys
-                        if step_key in selected_step_keys
+                        if step_key in materialized_step_keys
                     ]
+                if bptt_enabled:
+                    if trace_all_ce_selected_step_keys_by_batch is not None:
+                        endpoint_step_keys = set(
+                            trace_all_ce_selected_step_keys_by_batch.get(b, set())
+                        )
+                    else:
+                        endpoint_step_keys = set(trace_step_keys)
+                    windows = plan_bptt_windows(
+                        sc_b,
+                        endpoint_step_keys,
+                        horizon=bptt_horizon,
+                    )
+                    support_step_keys = bptt_support_step_keys(windows)
+                    trace_step_keys = sorted(
+                        step_key
+                        for step_key in {int(k) for k in sc_b.keys()}
+                        if step_key in support_step_keys
+                    )
+                    bptt_windows_by_batch[b] = windows
+                    bptt_endpoint_keys_by_batch[b] = endpoint_step_keys
                 # For causal_wrong_ce wrong responses: override step_keys to
                 # include only the is_final_denoise_row per (block_index),
                 # regardless of what state selection chose for correct responses.
@@ -16039,7 +16155,7 @@ class RayPPOTrainer:
                             trace_all_ce_packing_multi_block_samples += 1
                         else:
                             trace_all_ce_packing_single_block_samples += 1
-                if trace_all_ce_packing == "all_blocks_per_round":
+                if trace_all_ce_packing == "all_blocks_per_round" and not bptt_enabled:
                     # --- all_blocks_per_round packing ---
                     # Group by the physical destination block. Agent-loop step
                     # aliases may retain a producer block_idx that disagrees
@@ -16711,10 +16827,12 @@ class RayPPOTrainer:
                         build_self_conditioning_signal=(
                             not block_local_replay
                             and not trace_all_ce_sparse_pages
+                            and not bptt_enabled
                         ),
                         build_logits_source_hidden=(
                             not block_local_replay
                             and not trace_all_ce_sparse_pages
+                            and not bptt_enabled
                             and not trace_future_hard_label_ce
                         ),
                         trace_ce_label_mask_tail=trace_ce_label_mask_b,
@@ -16723,6 +16841,25 @@ class RayPPOTrainer:
                     ext_input_ids_b, ext_labels_b, ext_dense_labels_b, _, pmask_b, ge_mask_b, sc_signal_b, logits_source_b, has_any = out
                     if not has_any:
                         continue
+                    if bptt_enabled:
+                        # Keep only the captured block on the trainer/transport.
+                        # Response-length expansion belongs to the GPU microbatch.
+                        if sc_hidden_size is None or copy_len > block_length:
+                            raise RuntimeError("BPTT requires bounded replay blocks and a known hidden size")
+                        compact_fields = [
+                            self._build_block_local_replay_field(
+                                item,
+                                field_name=field_name,
+                                src_start=src_start,
+                                copy_len=copy_len,
+                                block_size=block_length,
+                                hidden_size=sc_hidden_size,
+                                dtype=sc_dtype,
+                                device=input_ids_aligned.device,
+                            )
+                            for field_name in ("self_conditioning_signal", "logits_source_hidden")
+                        ]
+                        sc_signal_b, logits_source_b = compact_fields
                     if trace_all_ce_replay_input_mode != "exact":
                         random_identity_b = (
                             int(trace_step_key)
@@ -16924,6 +17061,10 @@ class RayPPOTrainer:
                     if ar_sequence_advantages is not None:
                         ext_ar_sequence_advantages.append(ar_sequence_advantages[b])
                     ext_step_maps.append(round_step_b)
+                    if bptt_enabled:
+                        ext_bptt_step_keys.append(int(trace_step_key))
+                        bptt_block_starts.append(int(dst_start))
+                        bptt_block_lengths.append(int(copy_len))
                     if sampled_action_replay_enabled:
                         assert tpf_action_ids_b is not None and tpf_action_mask_b is not None
                         ext_tpf_action_ids.append(tpf_action_ids_b)
@@ -17082,6 +17223,191 @@ class RayPPOTrainer:
         )
         ext_tpf_action_ids = torch.stack(ext_tpf_action_ids, dim=0) if ext_tpf_action_ids else None
         ext_tpf_action_mask = torch.stack(ext_tpf_action_mask, dim=0) if ext_tpf_action_mask else None
+        if bptt_enabled:
+            row_count = int(ext_input_ids.shape[0])
+            if len(ext_bptt_step_keys) != row_count:
+                raise RuntimeError(
+                    "LLaDA2 BPTT replay-row identities are misaligned: "
+                    f"step_keys={len(ext_bptt_step_keys)} rows={row_count}"
+                )
+            if (
+                ext_self_conditioning_signal is None
+                or int(ext_self_conditioning_signal.shape[0]) != row_count
+            ):
+                raise RuntimeError(
+                    "LLaDA2 BPTT requires one compact rollout self-conditioning "
+                    "signal for every materialized replay row"
+                )
+
+            row_by_state: dict[tuple[int, int], int] = {}
+            for row_index, (source_index, step_key) in enumerate(
+                zip(ext_idx, ext_bptt_step_keys, strict=True)
+            ):
+                identity = (int(source_index), int(step_key))
+                if identity in row_by_state:
+                    raise RuntimeError(
+                        "LLaDA2 BPTT received duplicate unpacked replay rows for "
+                        f"sample={source_index}, step_key={step_key}"
+                    )
+                row_by_state[identity] = row_index
+
+            endpoint_rows: list[int] = []
+            predecessor_rows: list[list[int]] = []
+            predecessor_keys: list[list[int]] = []
+            predecessor_valid: list[list[bool]] = []
+            depth = bptt_horizon - 1
+            for row_index, (source_index, step_key) in enumerate(
+                zip(ext_idx, ext_bptt_step_keys, strict=True)
+            ):
+                if int(step_key) not in bptt_endpoint_keys_by_batch.get(
+                    int(source_index), set()
+                ):
+                    continue
+                window = bptt_windows_by_batch[int(source_index)][int(step_key)]
+                if not window or int(window[-1]) != int(step_key):
+                    raise RuntimeError(
+                        "LLaDA2 BPTT window does not end at its supervised state: "
+                        f"sample={source_index}, endpoint={step_key}, window={window}"
+                    )
+                predecessors = list(window[:-1])
+                pad_count = depth - len(predecessors)
+                padded_rows = [row_index] * pad_count
+                padded_keys = [-1] * pad_count
+                valid = [False] * pad_count
+                for predecessor_key in predecessors:
+                    identity = (int(source_index), int(predecessor_key))
+                    if identity not in row_by_state:
+                        raise RuntimeError(
+                            "LLaDA2 BPTT predecessor was selected for support but "
+                            "not materialized: "
+                            f"sample={source_index}, endpoint={step_key}, "
+                            f"predecessor={predecessor_key}"
+                        )
+                    padded_rows.append(row_by_state[identity])
+                    padded_keys.append(int(predecessor_key))
+                    valid.append(True)
+                endpoint_rows.append(row_index)
+                predecessor_rows.append(padded_rows)
+                predecessor_keys.append(padded_keys)
+                predecessor_valid.append(valid)
+
+            if not endpoint_rows:
+                raise RuntimeError("LLaDA2 BPTT produced no supervised endpoint rows")
+            endpoint_index = torch.tensor(
+                endpoint_rows,
+                dtype=torch.long,
+                device=ext_input_ids.device,
+            )
+            predecessor_index = torch.tensor(
+                predecessor_rows,
+                dtype=torch.long,
+                device=ext_input_ids.device,
+            )
+            block_starts = torch.tensor(bptt_block_starts, dtype=torch.long, device=ext_input_ids.device)
+            block_lengths = torch.tensor(bptt_block_lengths, dtype=torch.long, device=ext_input_ids.device)
+            bptt_payload = {
+                "bptt_input_ids": ext_input_ids[predecessor_index],
+                "bptt_responses": ext_labels[:, L0 + L1 :][predecessor_index],
+                "bptt_block_starts": block_starts[predecessor_index],
+                "bptt_block_lengths": block_lengths[predecessor_index],
+                "rollout_self_conditioning_signal_block_values": ext_self_conditioning_signal[endpoint_index],
+                "rollout_self_conditioning_signal_block_starts": block_starts[endpoint_index],
+                "rollout_self_conditioning_signal_block_lengths": block_lengths[endpoint_index],
+                "rollout_logits_source_hidden_block_values": ext_logits_source_hidden[endpoint_index],
+                "rollout_logits_source_hidden_block_starts": block_starts[endpoint_index],
+                "rollout_logits_source_hidden_block_lengths": block_lengths[endpoint_index],
+                "bptt_rollout_self_conditioning_signal": (
+                    ext_self_conditioning_signal[predecessor_index]
+                ),
+                "bptt_valid_mask": torch.tensor(
+                    predecessor_valid,
+                    dtype=torch.bool,
+                    device=ext_input_ids.device,
+                ),
+                "bptt_step_keys": torch.tensor(
+                    predecessor_keys,
+                    dtype=torch.long,
+                    device=ext_input_ids.device,
+                ),
+            }
+
+            ext_input_ids = ext_input_ids[endpoint_index]
+            ext_labels = ext_labels[endpoint_index]
+            ext_dense_labels = self._filter_tensor_rows(
+                ext_dense_labels, endpoint_index
+            )
+            ext_lp = ext_lp[endpoint_index]
+            ext_ar_probs = self._filter_tensor_rows(ext_ar_probs, endpoint_index)
+            ext_ar_sequence_advantages = self._filter_tensor_rows(
+                ext_ar_sequence_advantages, endpoint_index
+            )
+            ext_step_maps = ext_step_maps[endpoint_index]
+            ext_pmask = ext_pmask[endpoint_index]
+            ext_ge_mask = ext_ge_mask[endpoint_index]
+            compact_hidden_bytes = sum(
+                value.numel() * value.element_size()
+                for key, value in bptt_payload.items()
+                if key.endswith("block_values") or key == "bptt_rollout_self_conditioning_signal"
+            )
+            print(
+                f"[BPTT] endpoints={len(endpoint_rows)} horizon={bptt_horizon} "
+                f"compact_hidden_bytes={compact_hidden_bytes} "
+                f"hidden_compression_ratio={L1 / block_length:.1f}",
+                flush=True,
+            )
+            # Already carried in bounded block fields in bptt_payload.
+            ext_self_conditioning_signal = None
+            ext_logits_source_hidden = None
+            endpoint_rows_cpu = endpoint_index.detach().cpu().tolist()
+            ext_idx = [ext_idx[index] for index in endpoint_rows_cpu]
+            ext_bptt_step_keys = [
+                ext_bptt_step_keys[index] for index in endpoint_rows_cpu
+            ]
+            if manifest_enabled:
+                manifest_sample_indices = [
+                    manifest_sample_indices[index] for index in endpoint_rows_cpu
+                ]
+                manifest_train_step_keys = [
+                    manifest_train_step_keys[index] for index in endpoint_rows_cpu
+                ]
+                manifest_teacher_step_keys = [
+                    manifest_teacher_step_keys[index] for index in endpoint_rows_cpu
+                ]
+            trace_all_ce_rows = len(endpoint_rows)
+            trace_all_ce_candidate_label_tokens = int(
+                ext_labels[:, L0 + L1 :].ne(-100).sum().item()
+            )
+            trace_all_ce_block_tokens = trace_all_ce_candidate_label_tokens
+            if trace_all_ce_packing == "all_blocks_per_round":
+                packed, bptt_payload, groups = pack_bptt_replay_rows(
+                    dict(input_ids=ext_input_ids, labels=ext_labels,
+                         dense_labels=ext_dense_labels, lp=ext_lp, ar_probs=ext_ar_probs,
+                         ar_sequence_advantages=ext_ar_sequence_advantages,
+                         step_maps=ext_step_maps, pmask=ext_pmask, ge_mask=ext_ge_mask),
+                    bptt_payload, ext_idx, ext_bptt_step_keys,
+                    response_length=L1, block_size=block_length,
+                    max_blocks=int(bptt_cfg.get("packing_max_blocks", 32)),
+                )
+                ext_input_ids, ext_labels = packed["input_ids"], packed["labels"]
+                ext_dense_labels, ext_lp = packed["dense_labels"], packed["lp"]
+                ext_ar_probs = packed["ar_probs"]
+                ext_ar_sequence_advantages = packed["ar_sequence_advantages"]
+                ext_step_maps, ext_pmask, ext_ge_mask = packed["step_maps"], packed["pmask"], packed["ge_mask"]
+                ext_idx = [ext_idx[group[0]] for group in groups]
+                if manifest_enabled:
+                    manifest_sample_indices = [manifest_sample_indices[group[0]] for group in groups]
+                    manifest_train_step_keys = [None] * len(groups)
+                    manifest_teacher_step_keys = [None] * len(groups)
+                trace_all_ce_rows = len(groups)
+                trace_all_ce_packing_unpacked_rows = len(endpoint_rows)
+                trace_all_ce_packing_packed_rows = len(groups)
+                trace_all_ce_packing_blocks_per_row_counts = [len(group) for group in groups]
+                print(
+                    f"[BPTT_PACKING] endpoints={len(endpoint_rows)} packed_rows={len(groups)} "
+                    f"rows_reduction={len(endpoint_rows) / len(groups):.2f} "
+                    f"max_blocks={max(map(len, groups))} labels={trace_all_ce_candidate_label_tokens}",
+                    flush=True,
+                )
         ext_tpf_rewards = None
         ext_tpf_advantages = None
         ext_tpf_selected_mask = None
@@ -17559,6 +17885,24 @@ class RayPPOTrainer:
             expanded_non_tensor_batch["_replay_sample_index"] = np.asarray(manifest_sample_indices, dtype=np.int64)
             expanded_non_tensor_batch["_replay_train_step_key"] = np.asarray(manifest_train_step_keys, dtype=object)
             expanded_non_tensor_batch["_replay_teacher_step_key"] = np.asarray(manifest_teacher_step_keys, dtype=object)
+        if bptt_enabled:
+            expanded_non_tensor_batch["_llada2_bptt_payload"] = bptt_payload
+            tpf_metrics.update(
+                {
+                    "bptt/enabled": 1.0,
+                    "bptt/compact_hidden_bytes": float(sum(
+                        value.numel() * value.element_size()
+                        for key, value in bptt_payload.items()
+                        if "signal" in key or "hidden_block_values" in key
+                    )),
+                    "bptt/hidden_compression_ratio": float(L1 / block_length),
+                    "bptt/horizon": float(bptt_horizon),
+                    "bptt/endpoint_rows": float(len(ext_bptt_step_keys)),
+                    "bptt/predecessor_edges": float(
+                        bptt_payload["bptt_valid_mask"].sum().item()
+                    ),
+                }
+            )
         if block_local_replay:
             expanded_non_tensor_batch["_block_local_replay"] = True
             expanded_non_tensor_batch["_replay_block_starts"] = np.asarray(
@@ -19807,6 +20151,12 @@ class RayPPOTrainer:
                 "rm_scores": ext_rm_scores,
             }, batch_size=len(ext_input_ids)
         )
+        bptt_payload = expanded_non_tensor_batch.pop(
+            "_llada2_bptt_payload", None
+        )
+        if bptt_payload is not None:
+            for bptt_key, bptt_value in bptt_payload.items():
+                item_batch[bptt_key] = bptt_value
         causal_prob_filter_cfg = jsd_cfg.get(
             "causal_prob_ce_filter",
             {},

@@ -11,3 +11,7 @@ venv/
 .pytest_cache/
 .env
 *.safetensors
+.runtime/
+.logs/
+.exps/
+.eval/

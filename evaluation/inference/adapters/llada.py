@@ -29,7 +29,7 @@ def main():
     claim=args.out/'claims';claim.mkdir()
     environment=dict(os.environ,MODEL_DIR=str(args.model),ORL_ENGINE_ROOT=str(args.engine),CFG=str(cfg),PLAN=str(plan),
                      TEMP='0',ALGO='SDARPrefixKV',WORKER='0',CLAIM_DIR=str(claim),MEM_FRAC='0.60',
-                     ATTN_BACKEND='flashinfer',CUDA_VISIBLE_DEVICES='0')
+                     ATTN_BACKEND='flashinfer',CUDA_VISIBLE_DEVICES=os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
     subprocess.run([sys.executable,str(args.runtime/args.script)],env=environment,check=True)
 
 
